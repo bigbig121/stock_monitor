@@ -1,0 +1,5 @@
+__pycache__/
+*.spec
+build/
+# dist/  <-- Commented out because we are including the exe for now as per user request
+*.log
