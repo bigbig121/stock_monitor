@@ -233,8 +233,8 @@ def refresh_labels(data_map):
             
             if display_mode == "bar":
                 # 2. 柱状图 (Canvas)
-                # 设定固定宽度，例如 100px
-                bar_canvas = tk.Canvas(main_frame, bg="black", height=24, width=100, highlightthickness=0)
+                # 增加宽度到 150px，提升显示精度
+                bar_canvas = tk.Canvas(main_frame, bg="black", height=24, width=150, highlightthickness=0)
                 bar_canvas.grid(row=i, column=1, sticky="nswe", padx=5, pady=2)
                 bind_events(bar_canvas)
                 row_widgets['bar'] = bar_canvas
@@ -289,9 +289,9 @@ def refresh_labels(data_map):
             current_max_all = m
             
     # 规则: 
-    # 1. 至少显示 5% 的范围 (避免小波动填满格子)
-    # 2. 如果全局历史最大值超过 5%，则视口跟随扩张
-    view_ceiling = max(5.0, current_max_all)
+    # 1. 至少显示 2.5% 的范围 (降低默认阈值，让日常 0.x%~1% 的波动看起来更明显)
+    # 2. 如果全局历史最大值超过 2.5%，则视口跟随扩张 (兼容大行情)
+    view_ceiling = max(2.5, current_max_all)
     
     should_shake = False
     
@@ -336,7 +336,7 @@ def refresh_labels(data_map):
             # 只有有数据时才画
             if code in data_map:
                 w = canvas.winfo_width()
-                if w < 10: w = 100 # 初始可能未渲染，取默认
+                if w < 10: w = 150 # 初始可能未渲染，取默认
                 h = canvas.winfo_height()
                 if h < 10: h = 24
                 
