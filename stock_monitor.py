@@ -6,6 +6,7 @@ import threading
 import ctypes
 import json
 import os
+from datetime import datetime
 
 import math
 import random
@@ -25,7 +26,9 @@ update_thread = None
 root = None
 last_percentages = {} # 记录上次的涨跌幅: {code: percent}
 display_mode = "bar" # 显示模式: "percent" (百分比) 或 "bar" (柱状图)
+show_price = True # 是否显示价格
 session_max_map = {} # 本次运行期间每只股票出现过的最大涨跌幅绝对值 {code: max_percent}
+current_date_str = datetime.now().strftime("%Y-%m-%d") # 当前运行日期
 
 # 刷新频率（秒）
 REFRESH_RATE = 3
@@ -38,7 +41,7 @@ FONT_CONFIG = ("Microsoft YaHei UI", 10, "bold")
 
 def load_config():
     """加载配置文件"""
-    global STOCKS, display_mode
+    global STOCKS, display_mode, session_max_map, show_price
     if os.path.exists(CONFIG_FILE):
         try:
             with open(CONFIG_FILE, 'r', encoding='utf-8') as f:
@@ -49,17 +52,33 @@ def load_config():
                 elif isinstance(data, dict):
                     STOCKS = data.get("stocks", DEFAULT_STOCKS)
                     display_mode = data.get("display_mode", "bar")
+                    show_price = data.get("show_price", True)
+                    
+                    # 检查日期，如果是今天则恢复 session_max_map，否则重置
+                    saved_date = data.get("date", "")
+                    today = datetime.now().strftime("%Y-%m-%d")
+                    if saved_date == today:
+                        session_max_map = data.get("session_max_map", {})
+                    else:
+                        session_max_map = {}
         except Exception:
             STOCKS = DEFAULT_STOCKS
+            session_max_map = {}
+            show_price = True
     else:
         STOCKS = DEFAULT_STOCKS
+        session_max_map = {}
+        show_price = True
 
 def save_config():
     """保存配置文件"""
     try:
         data = {
             "stocks": STOCKS,
-            "display_mode": display_mode
+            "display_mode": display_mode,
+            "show_price": show_price,
+            "session_max_map": session_max_map,
+            "date": datetime.now().strftime("%Y-%m-%d")
         }
         with open(CONFIG_FILE, 'w', encoding='utf-8') as f:
             json.dump(data, f, ensure_ascii=False, indent=4)
@@ -190,6 +209,7 @@ main_frame = None
 stock_row_widgets = []
 last_display_mode = None
 last_stock_count = 0
+last_show_price = None
 
 def bind_events(widget):
     """绑定通用事件到组件"""
@@ -201,8 +221,16 @@ def bind_events(widget):
 def refresh_labels(data_map):
     """在主线程刷新Labels (重构版：支持Grid布局)"""
     global main_frame, stock_row_widgets, last_display_mode, last_stock_count, root, last_percentages
+    global session_max_map, current_date_str, show_price, last_show_price
     
     if not root: return
+    
+    # 检查日期变更 (处理跨天运行的情况)
+    today = datetime.now().strftime("%Y-%m-%d")
+    if today != current_date_str:
+        current_date_str = today
+        session_max_map = {} # 新的一天，重置历史最大值
+        save_config() # 更新配置文件中的日期
     
     # 初始化主容器
     if main_frame is None:
@@ -211,8 +239,10 @@ def refresh_labels(data_map):
         bind_events(main_frame) # 允许拖动背景
         
     # 检查是否需要重建布局
-    # 条件：模式改变 或 股票数量改变 (这里简单判断数量，更严谨应该判断内容，但数量通常足够)
-    need_rebuild = (display_mode != last_display_mode) or (len(STOCKS) != last_stock_count)
+    # 条件：模式改变 或 股票数量改变 或 价格显示设置改变
+    need_rebuild = (display_mode != last_display_mode) or \
+                   (len(STOCKS) != last_stock_count) or \
+                   (show_price != last_show_price)
     
     if need_rebuild:
         # 清除旧组件
@@ -223,52 +253,70 @@ def refresh_labels(data_map):
         # 重建布局
         for i, stock in enumerate(STOCKS):
             row_widgets = {}
+            col_idx = 0
             
             # 1. 名称 (所有模式都有)
             name_label = tk.Label(main_frame, text=stock['name'], bg="black", fg="white", 
                                  font=FONT_CONFIG, anchor="w")
-            name_label.grid(row=i, column=0, sticky="nswe", padx=(10, 5), pady=2)
+            name_label.grid(row=i, column=col_idx, sticky="nswe", padx=(10, 5), pady=2)
             bind_events(name_label)
             row_widgets['name'] = name_label
+            col_idx += 1
+            
+            # 2. 价格 (可选)
+            if show_price:
+                price_label = tk.Label(main_frame, text="--", bg="black", fg="white",
+                                     font=FONT_CONFIG, anchor="e")
+                price_label.grid(row=i, column=col_idx, sticky="nswe", padx=(5, 5), pady=2)
+                bind_events(price_label)
+                row_widgets['price'] = price_label
+                col_idx += 1
             
             if display_mode == "bar":
-                # 2. 柱状图 (Canvas)
+                # 3. 柱状图 (Canvas)
                 # 增加宽度到 150px，提升显示精度
                 bar_canvas = tk.Canvas(main_frame, bg="black", height=24, width=150, highlightthickness=0)
-                bar_canvas.grid(row=i, column=1, sticky="nswe", padx=5, pady=2)
+                bar_canvas.grid(row=i, column=col_idx, sticky="nswe", padx=5, pady=2)
                 bind_events(bar_canvas)
                 row_widgets['bar'] = bar_canvas
+                col_idx += 1
                 
-                # 3. 百分比
+                # 4. 百分比
                 pct_label = tk.Label(main_frame, text="--%", bg="black", fg="white",
                                     font=("Microsoft YaHei UI", 10, "bold"), anchor="e")
-                pct_label.grid(row=i, column=2, sticky="nswe", padx=(5, 10), pady=2)
+                pct_label.grid(row=i, column=col_idx, sticky="nswe", padx=(5, 10), pady=2)
                 bind_events(pct_label)
                 row_widgets['pct'] = pct_label
+                col_idx += 1
                 
             else: # percent mode
-                # 2. 百分比 (直接放在第二列)
+                # 3. 百分比 (直接放在下一列)
                 pct_label = tk.Label(main_frame, text="--%", bg="black", fg="white",
                                     font=FONT_CONFIG, anchor="e")
-                pct_label.grid(row=i, column=1, sticky="nswe", padx=(20, 10), pady=2) # 增加左侧间距实现"双列对齐"
+                pct_label.grid(row=i, column=col_idx, sticky="nswe", padx=(20, 10), pady=2) # 增加左侧间距实现"双列对齐"
                 bind_events(pct_label)
                 row_widgets['pct'] = pct_label
+                col_idx += 1
                 
             stock_row_widgets.append(row_widgets)
             
         last_display_mode = display_mode
         last_stock_count = len(STOCKS)
+        last_show_price = show_price
         
         # 配置列权重
-        main_frame.grid_columnconfigure(0, weight=0) # 名称列自适应
-        if display_mode == "bar":
-            main_frame.grid_columnconfigure(1, weight=0) # 柱状图固定
-            main_frame.grid_columnconfigure(2, weight=0) # 百分比自适应
-        else:
-            main_frame.grid_columnconfigure(1, weight=1) # 百分比列稍微弹一下？或者也自适应
+        # 无论多少列，最后一列（百分比）通常需要一点权重，或者名称列自适应
+        total_cols = col_idx
+        for c in range(total_cols):
+             main_frame.grid_columnconfigure(c, weight=0) # 默认不拉伸
+        
+        # 只有在百分比模式下，可能希望某些列拉伸填满
+        # 但为了紧凑，通常都设为0，由窗口大小决定? 
+        # 这里维持原逻辑：bar模式下都不拉伸，percent模式下最后一列拉伸
+        if display_mode == "percent":
+             main_frame.grid_columnconfigure(total_cols-1, weight=1) 
             
     # === 更新数据 ===
-    global session_max_map
     
     # 1. 更新每只股票的历史最大值 (Session Max)
     for code in data_map:
@@ -306,9 +354,10 @@ def refresh_labels(data_map):
         # 默认颜色
         color = "#cccccc"
         percent = 0.0
+        current_price = 0.0
         
         if code in data_map:
-            _, percent = data_map[code]
+            current_price, percent = data_map[code]
             color = "#ff3333" if percent > 0 else "#00cc00"
             if percent == 0: color = "#cccccc"
             
@@ -323,6 +372,11 @@ def refresh_labels(data_map):
         
         # 更新名称
         widgets['name'].config(text=display_name, fg=color)
+        
+        # 更新价格
+        if 'price' in widgets:
+            price_text = f"{current_price:.3f}" if code in data_map else "--"
+            widgets['price'].config(text=price_text, fg=color)
         
         # 更新百分比
         pct_text = f"{percent:+.2f}%" if code in data_map else "--"
@@ -452,6 +506,14 @@ def toggle_display_mode(mode):
     # 立即触发刷新
     if root: root.after(0, lambda: refresh_labels({}))
 
+def toggle_show_price():
+    """切换是否显示价格"""
+    global show_price
+    show_price = not show_price
+    save_config()
+    # 立即触发刷新
+    if root: root.after(0, lambda: refresh_labels({}))
+
 def show_context_menu(event):
     """显示右键菜单"""
     menu = tk.Menu(root, tearoff=0)
@@ -463,6 +525,11 @@ def show_context_menu(event):
     # 设置当前选中项 (Radiobutton需要variable才能同步显示选中状态，这里简化处理，只提供功能)
     
     menu.add_cascade(label="显示模式 (Display Mode)", menu=mode_menu)
+    
+    # 显示价格开关
+    price_label = "隐藏价格 (Hide Price)" if show_price else "显示价格 (Show Price)"
+    menu.add_command(label=price_label, command=toggle_show_price)
+    
     menu.add_separator()
     menu.add_command(label="设置 (Settings)", command=open_settings)
     menu.add_command(label="测试抖动 (Test Shake)", command=shake_window) # 方便测试
