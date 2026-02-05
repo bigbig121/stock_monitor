@@ -24,6 +24,8 @@ labels = []
 update_thread = None
 root = None
 last_percentages = {} # 记录上次的涨跌幅: {code: percent}
+display_mode = "bar" # 显示模式: "percent" (百分比) 或 "bar" (柱状图)
+session_max_map = {} # 本次运行期间每只股票出现过的最大涨跌幅绝对值 {code: max_percent}
 
 # 刷新频率（秒）
 REFRESH_RATE = 3
@@ -36,11 +38,17 @@ FONT_CONFIG = ("Microsoft YaHei UI", 10, "bold")
 
 def load_config():
     """加载配置文件"""
-    global STOCKS
+    global STOCKS, display_mode
     if os.path.exists(CONFIG_FILE):
         try:
             with open(CONFIG_FILE, 'r', encoding='utf-8') as f:
-                STOCKS = json.load(f)
+                data = json.load(f)
+                if isinstance(data, list):
+                    STOCKS = data
+                    # 兼容旧版本，display_mode 保持默认
+                elif isinstance(data, dict):
+                    STOCKS = data.get("stocks", DEFAULT_STOCKS)
+                    display_mode = data.get("display_mode", "bar")
         except Exception:
             STOCKS = DEFAULT_STOCKS
     else:
@@ -49,8 +57,12 @@ def load_config():
 def save_config():
     """保存配置文件"""
     try:
+        data = {
+            "stocks": STOCKS,
+            "display_mode": display_mode
+        }
         with open(CONFIG_FILE, 'w', encoding='utf-8') as f:
-            json.dump(STOCKS, f, ensure_ascii=False, indent=4)
+            json.dump(data, f, ensure_ascii=False, indent=4)
     except Exception as e:
         print(f"Error saving config: {e}")
 
@@ -173,127 +185,285 @@ def shake_window():
     # 恢复原位
     root.geometry(f"+{original_x}+{original_y}")
 
+# 全局变量用于缓存UI组件，避免重复创建
+main_frame = None
+stock_row_widgets = []
+last_display_mode = None
+last_stock_count = 0
+
+def bind_events(widget):
+    """绑定通用事件到组件"""
+    widget.bind("<Button-1>", start_drag)
+    widget.bind("<B1-Motion>", on_drag)
+    widget.bind("<Button-3>", show_context_menu)
+    widget.bind("<Double-Button-1>", minimize_window)
+
 def refresh_labels(data_map):
-    """在主线程刷新Labels"""
-    global labels, root, last_percentages
+    """在主线程刷新Labels (重构版：支持Grid布局)"""
+    global main_frame, stock_row_widgets, last_display_mode, last_stock_count, root, last_percentages
     
-    # 如果STOCKS变了，重新生成labels
-    if len(labels) != len(STOCKS):
-        for l in labels:
-            l.destroy()
-        labels = []
+    if not root: return
+    
+    # 初始化主容器
+    if main_frame is None:
+        main_frame = tk.Frame(root, bg="black")
+        main_frame.pack(fill="both", expand=True)
+        bind_events(main_frame) # 允许拖动背景
         
+    # 检查是否需要重建布局
+    # 条件：模式改变 或 股票数量改变 (这里简单判断数量，更严谨应该判断内容，但数量通常足够)
+    need_rebuild = (display_mode != last_display_mode) or (len(STOCKS) != last_stock_count)
+    
+    if need_rebuild:
+        # 清除旧组件
+        for widget in main_frame.winfo_children():
+            widget.destroy()
+        stock_row_widgets = []
+        
+        # 重建布局
         for i, stock in enumerate(STOCKS):
-            l = tk.Label(root, text="Loading...", bg="black", fg="white", font=FONT_CONFIG, anchor="center")
-            l.pack(fill="x", pady=2)
-            # 绑定事件
-            l.bind("<Button-1>", start_drag)
-            l.bind("<B1-Motion>", on_drag)
-            l.bind("<Button-3>", show_context_menu) # 右键菜单
-            l.bind("<Double-Button-1>", minimize_window)
-            labels.append(l)
+            row_widgets = {}
             
-    # 更新内容
-    max_text_len = 0
+            # 1. 名称 (所有模式都有)
+            name_label = tk.Label(main_frame, text=stock['name'], bg="black", fg="white", 
+                                 font=FONT_CONFIG, anchor="w")
+            name_label.grid(row=i, column=0, sticky="nswe", padx=(10, 5), pady=2)
+            bind_events(name_label)
+            row_widgets['name'] = name_label
+            
+            if display_mode == "bar":
+                # 2. 柱状图 (Canvas)
+                # 设定固定宽度，例如 100px
+                bar_canvas = tk.Canvas(main_frame, bg="black", height=24, width=100, highlightthickness=0)
+                bar_canvas.grid(row=i, column=1, sticky="nswe", padx=5, pady=2)
+                bind_events(bar_canvas)
+                row_widgets['bar'] = bar_canvas
+                
+                # 3. 百分比
+                pct_label = tk.Label(main_frame, text="--%", bg="black", fg="white",
+                                    font=("Microsoft YaHei UI", 10, "bold"), anchor="e")
+                pct_label.grid(row=i, column=2, sticky="nswe", padx=(5, 10), pady=2)
+                bind_events(pct_label)
+                row_widgets['pct'] = pct_label
+                
+            else: # percent mode
+                # 2. 百分比 (直接放在第二列)
+                pct_label = tk.Label(main_frame, text="--%", bg="black", fg="white",
+                                    font=FONT_CONFIG, anchor="e")
+                pct_label.grid(row=i, column=1, sticky="nswe", padx=(20, 10), pady=2) # 增加左侧间距实现"双列对齐"
+                bind_events(pct_label)
+                row_widgets['pct'] = pct_label
+                
+            stock_row_widgets.append(row_widgets)
+            
+        last_display_mode = display_mode
+        last_stock_count = len(STOCKS)
+        
+        # 配置列权重
+        main_frame.grid_columnconfigure(0, weight=0) # 名称列自适应
+        if display_mode == "bar":
+            main_frame.grid_columnconfigure(1, weight=0) # 柱状图固定
+            main_frame.grid_columnconfigure(2, weight=0) # 百分比自适应
+        else:
+            main_frame.grid_columnconfigure(1, weight=1) # 百分比列稍微弹一下？或者也自适应
+            
+    # === 更新数据 ===
+    global session_max_map
+    
+    # 1. 更新每只股票的历史最大值 (Session Max)
+    for code in data_map:
+        _, percent = data_map[code]
+        cur_abs = abs(percent)
+        if cur_abs > session_max_map.get(code, 0.0):
+            session_max_map[code] = cur_abs
+            
+    # 2. 计算全局视口上限 (View Ceiling)
+    # 取所有当前监控股票中的最大历史波动，作为统一的缩放基准
+    # 这样可以保证不同股票的柱状图长度是可比的 (例如: 1%的长度在所有行都一样)
+    current_max_all = 0.0
+    for stock in STOCKS:
+        code = stock['code']
+        # 即使股票不在当前data_map中(可能网络问题)，也应保留其历史最大值记录
+        m = session_max_map.get(code, 0.0)
+        if m > current_max_all:
+            current_max_all = m
+            
+    # 规则: 
+    # 1. 至少显示 5% 的范围 (避免小波动填满格子)
+    # 2. 如果全局历史最大值超过 5%，则视口跟随扩张
+    view_ceiling = max(5.0, current_max_all)
+    
     should_shake = False
     
     for i, stock in enumerate(STOCKS):
-        if i >= len(labels): break
+        if i >= len(stock_row_widgets): break
         
-        code = stock["code"]
+        widgets = stock_row_widgets[i]
+        code = stock['code']
+        display_name = stock['name']
+        if len(display_name) > 8: display_name = display_name[:8]
+        
+        # 默认颜色
+        color = "#cccccc"
+        percent = 0.0
+        
         if code in data_map:
-            price, percent = data_map[code]
-            
-            # === 检查是否需要抖动 ===
-            if code in last_percentages:
-                prev_percent = last_percentages[code]
-                
-                # 1. 盈亏转换 (跨越0轴)
-                # 优化：包含0的情况，比如从0变成负数也算转亏
-                if (prev_percent >= 0 and percent < 0) or (prev_percent <= 0 and percent > 0):
-                    should_shake = True
-                    print(f"Shake triggered: {stock['name']} {prev_percent}% -> {percent}%")
-                    
-                # 2. 整数关口突破 (如 0.9% -> 1.1%, 1.9% -> 2.1%)
-                # 使用 int(abs()) 获取整数部分
-                if int(abs(percent)) > int(abs(prev_percent)):
-                    should_shake = True
-            
-            # 更新历史记录
-            last_percentages[code] = percent
-            # ========================
-            
-            # 颜色逻辑：涨红跌绿
+            _, percent = data_map[code]
             color = "#ff3333" if percent > 0 else "#00cc00"
             if percent == 0: color = "#cccccc"
             
-            # 格式：名称 +0.50% 1776.27
-            # 限制名称长度，防止过长
-            display_name = stock['name']
-            if len(display_name) > 8: # 稍微放宽一点
-                display_name = display_name[:8]
+            # 抖动检测
+            if code in last_percentages:
+                prev_percent = last_percentages[code]
+                if (prev_percent >= 0 and percent < 0) or (prev_percent <= 0 and percent > 0):
+                    should_shake = True
+                if int(abs(percent)) > int(abs(prev_percent)):
+                    should_shake = True
+            last_percentages[code] = percent
+        
+        # 更新名称
+        widgets['name'].config(text=display_name, fg=color)
+        
+        # 更新百分比
+        pct_text = f"{percent:+.2f}%" if code in data_map else "--"
+        widgets['pct'].config(text=pct_text, fg=color)
+        
+        # 更新柱状图 (如果存在)
+        if 'bar' in widgets:
+            canvas = widgets['bar']
+            canvas.delete("all")
+            
+            # 只有有数据时才画
+            if code in data_map:
+                w = canvas.winfo_width()
+                if w < 10: w = 100 # 初始可能未渲染，取默认
+                h = canvas.winfo_height()
+                if h < 10: h = 24
                 
-            text = f"{display_name}  {percent:+.2f}%  {price:.2f}"
-        else:
-            text = f"{stock['name']} --"
-            color = "#cccccc"
-        
-        labels[i].config(text=text, fg=color)
-        
-        # 计算大致宽度（非常粗略的估算）
-        # 中文算2个字符宽度，英文数字算1个
-        # 额外加一些padding
-        current_len = 0
-        for char in text:
-            if '\u4e00' <= char <= '\u9fff':
-                current_len += 22 # 稍微调大一点字号对应的像素
-            else:
-                current_len += 12
-        if current_len > max_text_len:
-            max_text_len = current_len
+                # 居中绘制
+                center_x = w / 2
+                center_y = h / 2
+                
+                # === 绘制边界括号 (类似【】效果) ===
+                bracket_color = "#555555" # 深灰色边框
+                bracket_h = 14 # 括号高度
+                bracket_w = 3  # 括号勾的宽度
+                margin_x = 4   # 距离边缘距离
+                
+                y_top = center_y - (bracket_h / 2)
+                y_bottom = center_y + (bracket_h / 2)
+                
+                # 左括号 [
+                lx = margin_x
+                canvas.create_line(lx, y_top, lx, y_bottom, fill=bracket_color, width=2)
+                canvas.create_line(lx, y_top, lx+bracket_w, y_top, fill=bracket_color, width=2)
+                canvas.create_line(lx, y_bottom, lx+bracket_w, y_bottom, fill=bracket_color, width=2)
+                
+                # 右括号 ]
+                rx = w - margin_x
+                canvas.create_line(rx, y_top, rx, y_bottom, fill=bracket_color, width=2)
+                canvas.create_line(rx, y_top, rx-bracket_w, y_top, fill=bracket_color, width=2)
+                canvas.create_line(rx, y_bottom, rx-bracket_w, y_bottom, fill=bracket_color, width=2)
+                
+                # === 计算柱状图 (在括号内部) ===
+                # 左右各预留 12px 给括号和空隙
+                draw_w = w - 24
+                if draw_w < 10: draw_w = 10
+                
+                # 1. 灰色轨道长度
+                this_stock_max = session_max_map.get(code, 0.0)
+                track_len = (this_stock_max / view_ceiling) * draw_w
+                if track_len > draw_w: track_len = draw_w
+                if track_len < 4: track_len = 4 # 最小长度
 
-    # 动态调整窗口宽度
-    target_height = len(STOCKS) * 40
-    if target_height == 0: target_height = 40
+                # 2. 彩色柱子长度
+                bar_len = (abs(percent) / view_ceiling) * draw_w
+                if bar_len > draw_w: bar_len = draw_w
+                if bar_len < 2: bar_len = 2 # 最小长度
+                
+                # 颜色定义
+                bar_color = "#FF4D4F" if percent > 0 else "#52C41A" # 现代红绿
+                if percent == 0: bar_color = "#999999"
+                track_color = "#333333" # 轨道底色
+                
+                # 绘制轨道 (圆角背景)
+                line_width = 8 # 柱子粗细
+                
+                track_x1 = center_x - (track_len / 2)
+                track_x2 = center_x + (track_len / 2)
+                
+                canvas.create_line(track_x1, center_y, track_x2, center_y, 
+                                  width=line_width, fill=track_color, capstyle=tk.ROUND)
+                
+                # 绘制当前值 (圆角前景)
+                bar_x1 = center_x - (bar_len / 2)
+                bar_x2 = center_x + (bar_len / 2)
+                
+                # 确保最小长度能看清圆角
+                if bar_len < line_width: 
+                    bar_x1 = center_x
+                    bar_x2 = center_x
+                
+                canvas.create_line(bar_x1, center_y, bar_x2, center_y,
+                                  width=line_width, fill=bar_color, capstyle=tk.ROUND)
+
+    # 动态调整窗口大小
+    main_frame.update_idletasks() # 强制计算布局
+    req_width = main_frame.winfo_reqwidth()
+    req_height = main_frame.winfo_reqheight()
+    
+    # 增加一点padding
+    target_width = req_width
+    target_height = req_height
     
     current_width = root.winfo_width()
     current_height = root.winfo_height()
     
-    new_width = current_width
-    if max_text_len > 0:
-        # 加上左右padding
-        calc_width = max_text_len + 40 
-        # 保持最小宽度
-        if calc_width < 220: calc_width = 220
-        new_width = calc_width
-        
-    # 只在宽度变化较大或高度不一致时才调整
-    width_diff = abs(new_width - current_width)
-    height_diff = abs(target_height - current_height)
-    
-    if width_diff > 20 or height_diff > 0:
-        final_width = int(new_width) if width_diff > 20 else current_width
-        root.geometry(f"{final_width}x{target_height}+{root.winfo_x()}+{root.winfo_y()}")
+    # 只有差异大时才调整，防止抖动
+    if abs(target_width - current_width) > 5 or abs(target_height - current_height) > 5:
+        root.geometry(f"{target_width}x{target_height}+{root.winfo_x()}+{root.winfo_y()}")
 
-    # 触发抖动
     if should_shake:
-        # 使用 after 避免阻塞当前UI更新循环，虽然在主线程但也稍微延后一点
         root.after(50, shake_window)
 
 def start_drag(event):
-    event.widget.master.x = event.x
-    event.widget.master.y = event.y
+    root_win = event.widget.winfo_toplevel()
+    root_win.x = event.x
+    root_win.y = event.y
 
 def on_drag(event):
-    deltax = event.x - event.widget.master.x
-    deltay = event.y - event.widget.master.y
-    x = event.widget.master.winfo_x() + deltax
-    y = event.widget.master.winfo_y() + deltay
-    event.widget.master.geometry(f"+{x}+{y}")
+    root_win = event.widget.winfo_toplevel()
+    # 计算相对于屏幕的移动偏移量
+    # 注意：event.x 是相对于组件的坐标，不能直接用差值加到root位置
+    # 正确的做法是记录点击位置相对于root左上角的偏移，或者每次移动计算deltas
+    # 这里原来的逻辑是: deltax = event.x - start_x. 
+    # 如果start_x是相对于widget的，那么event.x也是。差值就是移动量。
+    deltax = event.x - root_win.x
+    deltay = event.y - root_win.y
+    x = root_win.winfo_x() + deltax
+    y = root_win.winfo_y() + deltay
+    root_win.geometry(f"+{x}+{y}")
+
+def toggle_display_mode(mode):
+    """切换显示模式"""
+    global display_mode
+    display_mode = mode
+    save_config()
+    # 立即触发刷新
+    if root: root.after(0, lambda: refresh_labels({}))
 
 def show_context_menu(event):
     """显示右键菜单"""
     menu = tk.Menu(root, tearoff=0)
+    
+    # 显示模式子菜单
+    mode_menu = tk.Menu(menu, tearoff=0)
+    mode_menu.add_radiobutton(label="纯百分比 (Percent)", command=lambda: toggle_display_mode("percent"))
+    mode_menu.add_radiobutton(label="柱状图 (Bar Chart)", command=lambda: toggle_display_mode("bar"))
+    # 设置当前选中项 (Radiobutton需要variable才能同步显示选中状态，这里简化处理，只提供功能)
+    
+    menu.add_cascade(label="显示模式 (Display Mode)", menu=mode_menu)
+    menu.add_separator()
     menu.add_command(label="设置 (Settings)", command=open_settings)
     menu.add_command(label="测试抖动 (Test Shake)", command=shake_window) # 方便测试
     menu.add_separator()
