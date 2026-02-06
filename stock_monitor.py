@@ -1,5 +1,6 @@
 import tkinter as tk
-from tkinter import simpledialog, messagebox
+from tkinter import simpledialog, messagebox, ttk
+from PIL import Image, ImageTk
 import requests
 import time
 import threading
@@ -31,7 +32,7 @@ session_max_map = {} # 本次运行期间每只股票出现过的最大涨跌幅
 current_date_str = datetime.now().strftime("%Y-%m-%d") # 当前运行日期
 
 # 刷新频率（秒）
-REFRESH_RATE = 3
+REFRESH_RATE = 1
 
 # 字体设置 
 # 使用 Microsoft YaHei UI 在 Windows 上显示更清晰
@@ -87,43 +88,167 @@ def save_config():
 
 def get_stock_data_tencent(codes):
     """
-    从腾讯财经接口批量获取数据
-    接口地址示例：http://qt.gtimg.cn/q=sh000681,sh000832
+    使用腾讯/新浪接口批量获取股票/期货/外汇数据
+    codes: [{"code": "sh000001", "name": "上证指数"}, ...]
     """
-    if not codes:
-        return {}
-    try:
-        # 拼接代码，如 sh000681,sh000832
-        code_str = ",".join([s["code"] for s in codes])
-        url = f"http://qt.gtimg.cn/q={code_str}"
-        resp = requests.get(url, timeout=2)
-        
-        # 腾讯接口返回GBK编码，需要正确解码
-        content = resp.content.decode('gbk')
-        
-        results = {}
-        # 解析返回数据
-        # 格式：v_sh000681="1~科创价格~000681~1775.82~1767.44~..."
-        lines = content.strip().split(';')
-        for line in lines:
-            if '="' not in line: continue
+    results = {}
+    
+    # 分离出需要用新浪接口查询的代码 (nf_开头 或 Au99.99等现货)
+    sina_codes = []
+    tencent_codes = []
+    
+    for s in codes:
+        code = s["code"]
+        # 扩展新浪接口支持的代码：期货(nf_) 和 现货(Au/Ag开头) 和 gds_开头
+        if code.startswith("nf_") or code.startswith("Au") or code.startswith("Ag") or code.startswith("Pt") or code.startswith("gds_"):
+            sina_codes.append(code)
+        else:
+            tencent_codes.append(code)
             
-            # 提取代码和数据
-            # line: v_sh000681="1~..."
-            key = line.split('="')[0].split('_')[1] # sh000681
-            data_str = line.split('="')[1].strip('"')
-            data = data_str.split('~')
+    # 1. 获取新浪数据 (期货/现货)
+    if sina_codes:
+        try:
+            # 新浪现货代码通常需要加 g_ 前缀 (如 Au99.99 -> g_Au99.99)
+            # 但 nf_ 开头的期货不需要
+            query_list = []
+            for c in sina_codes:
+                if c.startswith("nf_") or c.startswith("gds_"):
+                    query_list.append(c)
+                else:
+                    # 现货: 假设是 Au99.99 这种，尝试加 g_ (如果用户没加)
+                    if not c.startswith("g_"):
+                        query_list.append(f"g_{c}") # 尝试加 g_
+                    else:
+                        query_list.append(c)
+                        
+            url = f"http://hq.sinajs.cn/list={','.join(query_list)}"
+            headers = {'Referer': 'http://finance.sina.com.cn'}
+            resp = requests.get(url, headers=headers, timeout=2)
+            content = resp.content.decode('gbk', errors='ignore')
+            # 格式:
+            # var hq_str_nf_AU0="黄金连续,150000,1089.00,1105.60,..."
+            # var hq_str_g_Au99_99="370.00,370.00,368.50,371.80,..." 
+            # var hq_str_gds_AU9999="1094.00,0,1092.00,1094.00,1102.95,..."
             
-            if len(data) > 32:
-                current_price = float(data[3])
-                percent = float(data[32])
-                results[key] = (current_price, percent)
+            lines = content.strip().split(';')
+            for line in lines:
+                if '="' not in line: continue
+                try:
+                    key_part = line.split('="')[0] # var hq_str_nf_AU0
+                    # 提取原始 key
+                    if "_str_" in key_part:
+                        api_key = key_part.split('_str_')[1] # nf_AU0 or g_Au99.99 or gds_AU9999
+                        
+                        # 还原回用户输入的 code
+                        # 如果是 g_Au99.99，用户存的是 Au99.99
+                        user_code = api_key
+                        if api_key.startswith("g_") and not api_key.startswith("gds_"):
+                            user_code = api_key[2:]
+                        
+                        data_str = line.split('="')[1].strip('"')
+                        data = data_str.split(',')
+                        
+                        # 解析逻辑
+                        current_price = 0.0
+                        percent = 0.0
+                        
+                        if api_key.startswith("nf_"): # 期货
+                             if len(data) > 8:
+                                current_price = float(data[8])
+                                last_close = float(data[5])
+                                if last_close > 0:
+                                    percent = ((current_price - last_close) / last_close) * 100
+                        elif api_key.startswith("gds_"): # 贵金属现货 (gds_AU9999)
+                            # 格式: Current, ?, Open, High, LastClose?, Low? ...
+                            # 示例: 1094.00,0,1092.00,1094.00,1102.95,1049.01,...
+                            if len(data) > 4:
+                                current_price = float(data[0])
+                                last_close = float(data[4])
+                                if last_close > 0:
+                                    percent = ((current_price - last_close) / last_close) * 100
+                        else: # 其他现货 (Au99.99 / g_)
+                             if len(data) > 0:
+                                 current_price = float(data[0])
+                                 # 尝试计算涨跌幅，假设 data[4] 是昨收 (Common pattern)
+                                 if len(data) > 4:
+                                     last_close = float(data[4])
+                                     if last_close > 0:
+                                         percent = ((current_price - last_close) / last_close) * 100
+                        
+                        results[user_code] = (current_price, percent)
+                        # 同时保存 api_key 以防万一 (但 results key 必须匹配 STOCKS 中的 code)
+                        if user_code != api_key:
+                             results[api_key] = (current_price, percent)
+
+                except Exception:
+                    continue
+        except Exception as e:
+            pass
+
+    # 2. 获取腾讯数据 (股票/ETF/外汇/美股)
+    if tencent_codes:
+        try:
+            url = f"http://qt.gtimg.cn/q={','.join(tencent_codes)}"
+            resp = requests.get(url, timeout=2)
+            
+            # 腾讯接口返回GBK编码，需要正确解码
+            content = resp.content.decode('gbk', errors='ignore')
+            
+            # 解析返回数据
+            lines = content.strip().split(';')
+            for line in lines:
+                line = line.strip()
+                if '="' not in line: continue
                 
-        return results
+                # 提取代码和数据
+                # line: v_sh000681="1~..."
+                # 注意：对于 hf_XAU，key 可能是 hf_XAU
+                try:
+                    temp = line.split('="')[0]
+                    # 腾讯返回的变量名通常是 v_代码，如 v_sh000681, v_hf_XAU
+                    # 如果代码里包含下划线（如 hf_XAU），split('_') 会有多个部分
+                    # v_hf_XAU -> ['v', 'hf', 'XAU'] -> 取 [1:] 拼接？
+                    # 或者直接取 v_ 之后的部分
+                    key = temp[2:] # 去掉 "v_"
+                    
+                    data_str = line.split('="')[1].strip('"')
+                    
+                    # 1. 尝试普通股票格式 (~)
+                    data = data_str.split('~')
+                    if len(data) > 30:
+                        current_price = float(data[3])
+                        percent = float(data[32])
+                        results[key] = (current_price, percent)
+                        continue
+                        
+                    # 2. 尝试期货/外汇格式 (,)
+                    data_comma = data_str.split(',')
+                    if len(data_comma) > 5:
+                        current_price = float(data_comma[0])
+                        # 对于 hf_ 开头的代码，data_comma[1] 是涨跌幅百分比
+                        if key.startswith('hf_'):
+                            percent = float(data_comma[1])
+                        else:
+                            # 其他逗号分隔的数据 (如果有的话)，暂时保持原有逻辑或默认为0
+                            # 或者尝试计算: change_amount = data_comma[1]
+                            change_amount = float(data_comma[1])
+                            if current_price != 0:
+                                last_close = current_price - change_amount
+                                if last_close != 0:
+                                    percent = (change_amount / last_close) * 100
+                                else:
+                                    percent = 0.0
+                            else:
+                                percent = 0.0
+                                
+                        results[key] = (current_price, percent)
+                except Exception:
+                    continue
+        except Exception as e:
+            # print(f"Error: {e}")
+            pass
             
-    except Exception as e:
-        # print(f"Error: {e}")
-        return {}
+    return results
 
 def search_stocks_sina(keyword):
     """
@@ -514,6 +639,17 @@ def toggle_show_price():
     # 立即触发刷新
     if root: root.after(0, lambda: refresh_labels({}))
 
+def quit_app():
+    """退出程序，解决残留白框问题"""
+    global root
+    if root:
+        try:
+            root.withdraw() # 先隐藏窗口
+            root.quit()     # 停止主循环
+            root.destroy()  # 销毁窗口
+        except Exception:
+            pass
+
 def show_context_menu(event):
     """显示右键菜单"""
     menu = tk.Menu(root, tearoff=0)
@@ -531,18 +667,157 @@ def show_context_menu(event):
     menu.add_command(label=price_label, command=toggle_show_price)
     
     menu.add_separator()
-    menu.add_command(label="设置 (Settings)", command=open_settings)
-    menu.add_command(label="测试抖动 (Test Shake)", command=shake_window) # 方便测试
+    menu.add_command(label="配置股票", command=open_settings)
     menu.add_separator()
-    menu.add_command(label="退出 (Exit)", command=root.destroy)
-    menu.post(event.x_root, event.y_root)
+    menu.add_command(label="退出 (Exit)", command=quit_app)
+    
+    # 使用 tk_popup 替代 post，通常能更好地处理自动关闭
+    try:
+        menu.tk_popup(event.x_root, event.y_root)
+    finally:
+        # 确保释放抓取，防止菜单卡死
+        menu.grab_release()
 
 def open_settings():
     """打开设置窗口"""
+    
     settings_win = tk.Toplevel(root)
     settings_win.title("配置股票")
-    settings_win.geometry("700x700")
     
+    # === 计算显示位置：在悬浮窗正右方 ===
+    try:
+        root_x = root.winfo_x()
+        root_y = root.winfo_y()
+        root_w = root.winfo_width()
+        
+        # 目标位置
+        pos_x = root_x + root_w + 10
+        pos_y = root_y
+        
+        # 确保不超出屏幕太远 (简单判断)
+        screen_w = root.winfo_screenwidth()
+        if pos_x + 700 > screen_w:
+             # 如果右边放不下，就放左边
+             pos_x = root_x - 700 - 10
+             if pos_x < 0: pos_x = 10 # 实在放不下就放最左边
+        
+        settings_win.geometry(f"700x800+{pos_x}+{pos_y}")
+    except Exception:
+        settings_win.geometry("700x800") # 降级处理
+
+    
+    # === 预设添加 (重构：分级/多分类) ===
+    preset_frame = tk.LabelFrame(settings_win, text="快速添加预设 (常用指数/商品)", padx=5, pady=5)
+    preset_frame.pack(fill="x", padx=5, pady=5)
+    
+    # 预设数据字典
+    preset_categories = {
+        "金价": {
+            "国际金价": ("hf_XAU", "国际金价"),
+            "国内金价": ("gds_AU9999", "国内金价"),
+        },
+        "A股指数": {
+            "上证指数": ("sh000001", "上证指数"),
+            "深证成指": ("sz399001", "深证成指"),
+            "创业板指": ("sz399006", "创业板指"),
+            "科创50": ("sh000688", "科创50"),
+            "沪深300": ("sh000300", "沪深300"),
+            "中证500": ("sh000905", "中证500"),
+            "北证50": ("bj899050", "北证50"),
+        },
+        "港股指数": {
+            "恒生指数": ("hkHSI", "恒生指数"),
+            "恒生科技": ("hkHSTECH", "恒生科技"),
+            "国企指数": ("hkHSCEI", "国企指数"),
+        },
+        "美股": {
+            "道琼斯": ("us.DJI", "道琼斯"),
+            "纳斯达克": ("us.IXIC", "纳斯达克"),
+            "标普500": ("us.INX", "标普500"),
+        }
+    }
+    
+    # 定义确认函数 (改为直接添加)
+    def on_preset_add():
+        cat = cat_var.get()
+        item_key = item_var.get()
+        if cat in preset_categories and item_key in preset_categories[cat]:
+            code, name = preset_categories[cat][item_key]
+            
+            # 填入下方的编辑框 (方便用户查看)
+            code_entry.delete(0, tk.END)
+            code_entry.insert(0, code)
+            name_entry.delete(0, tk.END)
+            name_entry.insert(0, name)
+            
+            # 检查是否已存在
+            for s in STOCKS:
+                if s["code"] == code:
+                    messagebox.showinfo("提示", f"{name} ({code}) 已在列表中")
+                    return
+
+            # 添加到列表
+            STOCKS.append({"code": code, "name": name})
+            save_config()
+            refresh_list()
+            # messagebox.showinfo("成功", f"已添加 {name} 到监控列表") # 用户要求不弹窗
+
+    # 布局调整：使用 Frame + Pack 布局 (仿照搜索框样式)，恢复使用 ttk.Combobox (样式更好看)
+    # 并确保 Pack 布局正确
+    
+    # 顶部输入行容器
+    input_frame = tk.Frame(preset_frame)
+    input_frame.pack(fill="x", pady=5)
+    
+    # 1. 分类
+    tk.Label(input_frame, text="分类:").pack(side="left", padx=5)
+    
+    cat_var = tk.StringVar()
+    cat_choices = list(preset_categories.keys())
+    if cat_choices:
+        cat_var.set(cat_choices[0])
+    
+    # 彻底放弃 ttk.Combobox，改用原生 OptionMenu 以解决显示问题
+    cat_menu = tk.OptionMenu(input_frame, cat_var, *cat_choices)
+    cat_menu.config(width=10)
+    cat_menu.pack(side="left", padx=5)
+    
+    # 2. 品种
+    tk.Label(input_frame, text="品种:").pack(side="left", padx=5)
+    item_var = tk.StringVar()
+    
+    # 这里稍微复杂点，因为OptionMenu需要动态更新菜单项
+    # 我们先创建一个空的OptionMenu，然后通过 trace 变量来更新它
+    item_menu = tk.OptionMenu(input_frame, item_var, "")
+    item_menu.config(width=15)
+    item_menu.pack(side="left", padx=5)
+    
+    # 更新品种菜单的回调函数
+    def update_item_options(*args):
+        cat = cat_var.get()
+        if cat in preset_categories:
+            items = list(preset_categories[cat].keys())
+            
+            # 清除旧菜单
+            menu = item_menu["menu"]
+            menu.delete(0, "end")
+            
+            # 添加新菜单项
+            for item in items:
+                menu.add_command(label=item, command=lambda value=item: item_var.set(value))
+                
+            if items:
+                item_var.set(items[0])
+            else:
+                item_var.set("")
+
+    # 监听 cat_var 变化
+    cat_var.trace("w", update_item_options)
+    update_item_options() # 初始化
+    
+    # 3. 添加按钮
+    tk.Button(input_frame, text="添加", command=on_preset_add, width=8).pack(side="left", padx=10)
+
     # === 搜索区域 ===
     search_frame = tk.LabelFrame(settings_win, text="搜索股票 (输入名称/代码)", padx=5, pady=5)
     search_frame.pack(fill="x", padx=5, pady=5)
@@ -601,6 +876,48 @@ def open_settings():
     name_entry = tk.Entry(edit_frame)
     name_entry.grid(row=0, column=3, padx=5)
     
+    # === 联系作者 (Bottom) ===
+    contact_frame = tk.Frame(settings_win)
+    contact_frame.pack(side="bottom", fill="x", pady=10)
+    
+    contact_right = tk.Frame(contact_frame)
+    contact_right.pack(side="right", padx=20)
+    
+    tk.Label(contact_right, text="有问题联系我 👉", font=("Microsoft YaHei UI", 10)).pack(side="left", padx=(0, 5))
+    
+    def show_qrcode():
+        try:
+            qr_path = "qrcode_for_gh_d40602192370_344.jpg"
+            # 尝试绝对路径
+            if not os.path.exists(qr_path):
+                current_dir = os.path.dirname(os.path.abspath(__file__)) if '__file__' in globals() else os.getcwd()
+                qr_path = os.path.join(current_dir, "qrcode_for_gh_d40602192370_344.jpg")
+            
+            if not os.path.exists(qr_path):
+                # 再试一下 D:\doc\stock_monitor_project\qrcode_for_gh_d40602192370_344.jpg
+                qr_path = r"D:\doc\stock_monitor_project\qrcode_for_gh_d40602192370_344.jpg"
+                
+            if not os.path.exists(qr_path):
+                messagebox.showerror("错误", f"找不到二维码文件")
+                return
+                
+            top = tk.Toplevel(settings_win)
+            top.title("扫码关注公众号")
+            top.geometry("400x400")
+            
+            img = Image.open(qr_path)
+            img.thumbnail((350, 350))
+            photo = ImageTk.PhotoImage(img)
+            
+            lbl = tk.Label(top, image=photo)
+            lbl.image = photo 
+            lbl.pack(expand=True, fill="both")
+            
+        except Exception as e:
+            messagebox.showerror("错误", f"无法打开图片: {e}")
+
+    tk.Button(contact_right, text="关注公众号", command=show_qrcode, bg="#4CAF50", fg="white").pack(side="left")
+
     # === 列表区域 ===
     list_frame = tk.LabelFrame(settings_win, text="当前监控列表", padx=5, pady=5)
     list_frame.pack(fill="both", expand=True, padx=5, pady=5)
