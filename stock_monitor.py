@@ -991,18 +991,36 @@ def generate_analysis_data(code, name):
     
     # 趋势分 (3分)
     trend_desc = "震荡"
-    if ma20:
+    
+    # 细化趋势描述与评分
+    if ma5 and ma20:
+        if ma5 > ma20:
+            if current_price > ma20:
+                trend_desc = "多头排列"
+                score += 1.0
+            else:
+                trend_desc = "回调震荡"
+                score -= 0.5 # 破位风险
+        else: # ma5 < ma20
+            if current_price > ma20:
+                trend_desc = "反弹震荡"
+                score += 0.5 # 弱势反弹
+            else:
+                trend_desc = "空头排列"
+                score -= 1.0
+    elif ma20:
+        # 只有MA20的情况 (新股或数据不足)
         if current_price > ma20: 
-            score += 1
-            trend_desc = "多头"
+            score += 0.5
+            trend_desc = "站上均线"
         else: 
-            score -= 1
-            trend_desc = "空头"
-            
-    # 均线排列
+            score -= 0.5
+            trend_desc = "均线压制"
+
+    # 均线交叉评分 (额外加分项)
     if ma5 and ma20:
         if ma5 > ma20: score += 0.5
-        elif ma5 < ma20: score -= 0.5 # 空头排列扣分
+        elif ma5 < ma20: score -= 0.5
     
     if macd:
         # MACD 金叉/死叉
