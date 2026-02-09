@@ -988,6 +988,7 @@ def generate_analysis_data(code, name):
     
     # 4. 综合研判打分
     score = 0
+    factors = [] # 记录得分因子 (描述, 分数变动)
     
     # 趋势分 (3分)
     trend_desc = "震荡"
@@ -998,37 +999,55 @@ def generate_analysis_data(code, name):
             if current_price > ma20:
                 trend_desc = "多头排列"
                 score += 1.0
+                factors.append(("多头排列", 1.0))
             else:
                 trend_desc = "回调震荡"
                 score -= 0.5 # 破位风险
+                factors.append(("回调破位", -0.5))
         else: # ma5 < ma20
             if current_price > ma20:
                 trend_desc = "反弹震荡"
                 score += 0.5 # 弱势反弹
+                factors.append(("弱势反弹", 0.5))
             else:
                 trend_desc = "空头排列"
                 score -= 1.0
+                factors.append(("空头排列", -1.0))
     elif ma20:
         # 只有MA20的情况 (新股或数据不足)
         if current_price > ma20: 
             score += 0.5
             trend_desc = "站上均线"
+            factors.append(("站上均线", 0.5))
         else: 
             score -= 0.5
             trend_desc = "均线压制"
+            factors.append(("均线压制", -0.5))
 
     # 均线交叉评分 (额外加分项)
     if ma5 and ma20:
-        if ma5 > ma20: score += 0.5
-        elif ma5 < ma20: score -= 0.5
+        if ma5 > ma20: 
+            score += 0.5
+            factors.append(("MA5金叉", 0.5))
+        elif ma5 < ma20: 
+            score -= 0.5
+            factors.append(("MA5死叉", -0.5))
     
     if macd:
         # MACD 金叉/死叉
-        if macd['dif'] > macd['dea']: score += 0.5 # 金叉状态
-        elif macd['dif'] < macd['dea']: score -= 0.5 # 死叉状态
+        if macd['dif'] > macd['dea']: 
+            score += 0.5 # 金叉状态
+            factors.append(("MACD金叉", 0.5))
+        elif macd['dif'] < macd['dea']: 
+            score -= 0.5 # 死叉状态
+            factors.append(("MACD死叉", -0.5))
         
-        if macd['macd'] > 0 and macd['macd'] > macd['prev_macd']: score += 0.5 # 红柱增长
-        if macd['dif'] > 0 and macd['dea'] > 0: score += 0.5 # 零轴上方
+        if macd['macd'] > 0 and macd['macd'] > macd['prev_macd']: 
+            score += 0.5 # 红柱增长
+            factors.append(("红柱增长", 0.5))
+        if macd['dif'] > 0 and macd['dea'] > 0: 
+            score += 0.5 # 零轴上方
+            factors.append(("零轴上方", 0.5))
     
     # 资金分 (2分)
     vol_desc = "平量"
@@ -1037,16 +1056,25 @@ def generate_analysis_data(code, name):
         vol_ratio = vol_today / vol_ma5
         if vol_ratio > 1.5: 
             vol_desc = "放量"
-            if current_price > yesterday_price: score += 1 # 放量涨
-            else: score -= 1 # 放量跌
+            if current_price > yesterday_price: 
+                score += 1 # 放量涨
+                factors.append(("放量上涨", 1.0))
+            else: 
+                score -= 1 # 放量跌
+                factors.append(("放量下跌", -1.0))
         elif vol_ratio < 0.6: 
             vol_desc = "缩量"
-            if current_price < yesterday_price: score += 0.5 # 缩量跌(惜售)
-            elif current_price > yesterday_price: score -= 0.5 # 缩量涨(背离风险)
+            if current_price < yesterday_price: 
+                score += 0.5 # 缩量跌(惜售)
+                factors.append(("缩量下跌", 0.5))
+            elif current_price > yesterday_price: 
+                score -= 0.5 # 缩量涨(背离风险)
+                factors.append(("缩量上涨", -0.5))
         
         # 补充逻辑：如果放量过大 (>3.0) 且在高位，可能是出货，扣分
         if vol_ratio > 3.0 and current_price > ma20:
              score -= 0.5
+             factors.append(("高位巨量", -0.5))
             
     # 情绪分 (2分)
     sentiment_desc = "中性"
@@ -1054,18 +1082,29 @@ def generate_analysis_data(code, name):
         if rsi > 80: 
             score -= 1
             sentiment_desc = "超买"
+            factors.append(("RSI超买", -1.0))
         elif rsi < 20: 
             score += 1.5 # 超卖反弹权重高
             sentiment_desc = "超卖"
+            factors.append(("RSI超卖", 1.5))
             
     if kdj:
         # KDJ 金叉/死叉
-        if kdj['k'] > kdj['d']: score += 0.5 # 金叉
-        elif kdj['k'] < kdj['d']: score -= 0.5 # 死叉
+        if kdj['k'] > kdj['d']: 
+            score += 0.5 # 金叉
+            factors.append(("KDJ金叉", 0.5))
+        elif kdj['k'] < kdj['d']: 
+            score -= 0.5 # 死叉
+            factors.append(("KDJ死叉", -0.5))
         
         if kdj['j'] < 0 or kdj['j'] > 100:
-             if kdj['j'] < 0: score += 0.5
-             if kdj['j'] > 100: score -= 1.0 # J值过高风险极大
+             if kdj['j'] < 0: 
+                 score += 0.5
+                 factors.append(("KDJ超卖", 0.5))
+             if kdj['j'] > 100: 
+                 score -= 1.0 # J值过高风险极大
+                 factors.append(("KDJ超买", -1.0))
+
 
              
     # 结论
@@ -1101,7 +1140,8 @@ def generate_analysis_data(code, name):
         "kdj": kdj,
         "conclusion": conclusion,
         "action_color": action_color,
-        "score": score
+        "score": score,
+        "factors": factors
     }
 
 def show_analysis_result(name, stock_info=None):
@@ -1120,7 +1160,7 @@ def show_analysis_result(name, stock_info=None):
     
     # === 窗口尺寸与定位 (侧边弹出) ===
     width = 540 # 增加宽度以容纳长数字
-    height = 700
+    height = 880 # 再次增加高度以容纳更多得分因子标签
     
     screen_w = root.winfo_screenwidth()
     screen_h = root.winfo_screenheight()
@@ -1188,7 +1228,7 @@ def show_analysis_result(name, stock_info=None):
              
     # 2. 结论卡片 (高亮)
     con_frame = tk.Frame(content_frame, bg=stock_info['action_color'], padx=2, pady=2) # 边框色
-    con_frame.pack(fill="x", pady=(0, 15))
+    con_frame.pack(fill="x", pady=(0, 10))
     con_inner = tk.Frame(con_frame, bg="#252526", padx=10, pady=10)
     con_inner.pack(fill="both", expand=True)
     
@@ -1203,7 +1243,51 @@ def show_analysis_result(name, stock_info=None):
              
     # 右下角显示分数
     tk.Label(con_inner, text=f"Score: {stock_info['score']:.1f}", font=("Arial", 8), bg="#252526", fg="#666666").pack(anchor="e")
-             
+    
+    # === 得分因子标签云 (流式布局) ===
+    if 'factors' in stock_info and stock_info['factors']:
+        # 排序：加分在前，减分在后
+        pos_factors = [f for f in stock_info['factors'] if f[1] > 0]
+        neg_factors = [f for f in stock_info['factors'] if f[1] <= 0]
+        all_factors = pos_factors + neg_factors
+        
+        if all_factors:
+            tags_frame = tk.Frame(content_frame, bg="#1E1E1E")
+            tags_frame.pack(fill="x", pady=(0, 15))
+            
+            # 流式布局简单的实现方式
+            current_row = tk.Frame(tags_frame, bg="#1E1E1E")
+            current_row.pack(fill="x", pady=2)
+            
+            current_w = 0
+            max_w = 460 # 估算可用宽度 (540 - padding)
+            
+            for desc, points in all_factors:
+                sign = "+" if points > 0 else ""
+                tag_text = f"{desc} {sign}{points}"
+                
+                # 估算宽度 (中文约14px, 英文约8px, padding 10px)
+                # 简单估算: 字符数 * 10 + 20
+                item_w = len(tag_text) * 12 + 20
+                
+                if current_w + item_w > max_w:
+                    current_row = tk.Frame(tags_frame, bg="#1E1E1E")
+                    current_row.pack(fill="x", pady=2)
+                    current_w = 0
+                
+                # 颜色配置
+                if points > 0:
+                    fg_color = "#FF4D4F" # 红字
+                    bg_color = "#2A1215" # 深红底
+                else:
+                    fg_color = "#52C41A" # 绿字
+                    bg_color = "#132313" # 深绿底
+                
+                tk.Label(current_row, text=tag_text, font=("Microsoft YaHei UI", 9),
+                         bg=bg_color, fg=fg_color, padx=6, pady=2).pack(side="left", padx=3)
+                
+                current_w += item_w + 6
+
     # 3. 指标网格
     grid_frame = tk.Frame(content_frame, bg="#1E1E1E")
     grid_frame.pack(fill="both", expand=True)
@@ -1214,9 +1298,10 @@ def show_analysis_result(name, stock_info=None):
         # 调整列宽权重
         row.columnconfigure(1, weight=1)
         
-        tk.Label(row, text=label, font=("Microsoft YaHei UI", 10), bg="#1E1E1E", fg="#888888", width=10, anchor="w").grid(row=0, column=0, sticky="w")
-        tk.Label(row, text=value, font=("Arial", 10, "bold"), bg="#1E1E1E", fg="white").grid(row=0, column=1, sticky="w", padx=5)
-        tk.Label(row, text=sub_value, font=("Microsoft YaHei UI", 9), bg="#1E1E1E", fg=status_color).grid(row=0, column=2, sticky="e")
+        # 调整宽度和字体以防止重叠
+        tk.Label(row, text=label, font=("Microsoft YaHei UI", 10), bg="#1E1E1E", fg="#888888", width=8, anchor="w").grid(row=0, column=0, sticky="w")
+        tk.Label(row, text=value, font=("Microsoft YaHei UI", 10, "bold"), bg="#1E1E1E", fg="white", width=10, anchor="w").grid(row=0, column=1, sticky="w", padx=5)
+        tk.Label(row, text=sub_value, font=("Microsoft YaHei UI", 8), bg="#1E1E1E", fg=status_color).grid(row=0, column=2, sticky="e")
         return row
 
     # 趋势
