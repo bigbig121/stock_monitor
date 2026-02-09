@@ -12,7 +12,7 @@ from datetime import datetime
 import math
 import random
 
-VERSION = "0.4.3"
+VERSION = "0.4.4"
 
 # ================= 配置区域 =================
 CONFIG_FILE = "stock_config.json"
