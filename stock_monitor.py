@@ -1042,6 +1042,11 @@ def generate_analysis_data(code, name):
         elif vol_ratio < 0.6: 
             vol_desc = "缩量"
             if current_price < yesterday_price: score += 0.5 # 缩量跌(惜售)
+            elif current_price > yesterday_price: score -= 0.5 # 缩量涨(背离风险)
+        
+        # 补充逻辑：如果放量过大 (>3.0) 且在高位，可能是出货，扣分
+        if vol_ratio > 3.0 and current_price > ma20:
+             score -= 0.5
             
     # 情绪分 (2分)
     sentiment_desc = "中性"
@@ -1060,7 +1065,8 @@ def generate_analysis_data(code, name):
         
         if kdj['j'] < 0 or kdj['j'] > 100:
              if kdj['j'] < 0: score += 0.5
-             if kdj['j'] > 100: score -= 0.5
+             if kdj['j'] > 100: score -= 1.0 # J值过高风险极大
+
              
     # 结论
     conclusion = "观察"
@@ -1113,7 +1119,7 @@ def show_analysis_result(name, stock_info=None):
     top.attributes("-topmost", True) # 确保置顶，防止被误认为关闭
     
     # === 窗口尺寸与定位 (侧边弹出) ===
-    width = 500
+    width = 540 # 增加宽度以容纳长数字
     height = 700
     
     screen_w = root.winfo_screenwidth()
@@ -1205,9 +1211,12 @@ def show_analysis_result(name, stock_info=None):
     def create_metric_row(parent, label, value, sub_value, status_color="#FFFFFF"):
         row = tk.Frame(parent, bg="#1E1E1E", pady=3)
         row.pack(fill="x")
-        tk.Label(row, text=label, font=("Microsoft YaHei UI", 10), bg="#1E1E1E", fg="#888888", width=8, anchor="w").pack(side="left")
-        tk.Label(row, text=value, font=("Arial", 10, "bold"), bg="#1E1E1E", fg="white").pack(side="left")
-        tk.Label(row, text=sub_value, font=("Microsoft YaHei UI", 9), bg="#1E1E1E", fg=status_color).pack(side="right")
+        # 调整列宽权重
+        row.columnconfigure(1, weight=1)
+        
+        tk.Label(row, text=label, font=("Microsoft YaHei UI", 10), bg="#1E1E1E", fg="#888888", width=10, anchor="w").grid(row=0, column=0, sticky="w")
+        tk.Label(row, text=value, font=("Arial", 10, "bold"), bg="#1E1E1E", fg="white").grid(row=0, column=1, sticky="w", padx=5)
+        tk.Label(row, text=sub_value, font=("Microsoft YaHei UI", 9), bg="#1E1E1E", fg=status_color).grid(row=0, column=2, sticky="e")
         return row
 
     # 趋势
