@@ -12,7 +12,7 @@ from datetime import datetime
 import math
 import random
 
-VERSION = "0.4.0"
+VERSION = "0.4.3"
 
 # ================= 配置区域 =================
 CONFIG_FILE = "stock_config.json"
@@ -819,9 +819,469 @@ def quit_app():
         except Exception:
             pass
 
+# ================= AI技术分析模块 =================
+def get_kline_data_analysis(code):
+    """获取K线数据 (用于技术分析)"""
+    # 简单的代码转换
+    api_code = code
+    if code.startswith("csi"): api_code = "sh" + code[3:]
+    elif code.startswith("sh1b"): api_code = "sh00" + code[4:]
+    
+    # 不支持非股票/指数代码
+    if code.startswith(("hf_", "gds_", "nf_", "Au", "Ag", "Pt")):
+        return None
+
+    # 获取100天日K
+    url = f"http://web.ifzq.gtimg.cn/appstock/app/fqkline/get?param={api_code},day,,,100,qfq"
+    try:
+        resp = requests.get(url, timeout=3)
+        if resp.status_code != 200: return None
+        data = resp.json()
+        
+        stock_data = data['data'].get(api_code, {})
+        # 兼容不同字段名
+        kline = stock_data.get('qfqday', stock_data.get('day', []))
+        
+        parsed_data = []
+        for item in kline:
+            # item: [date, open, close, high, low, volume, ...]
+            parsed_data.append({
+                "date": item[0],
+                "open": float(item[1]),
+                "close": float(item[2]),
+                "high": float(item[3]),
+                "low": float(item[4]),
+                "volume": float(item[5])
+            })
+        return parsed_data
+    except Exception as e:
+        print(f"Analysis Error: {e}")
+        return None
+
+def calculate_ma(data, days):
+    """计算移动平均线"""
+    if len(data) < days:
+        return None
+    
+    # 取最后N天
+    subset = data[-days:]
+    avg = sum(d['close'] for d in subset) / days
+    return avg
+
+def calculate_rsi(data, periods=14):
+    """计算RSI相对强弱指标"""
+    if len(data) < periods + 1:
+        return None
+        
+    gains = []
+    losses = []
+    
+    # 计算每日涨跌
+    for i in range(1, len(data)):
+        change = data[i]['close'] - data[i-1]['close']
+        if change > 0:
+            gains.append(change)
+            losses.append(0)
+        else:
+            gains.append(0)
+            losses.append(abs(change))
+            
+    # 只取最近N天用于计算初始值 (简单算法)
+    # 标准RSI需要平滑移动平均，这里用简单平均模拟近似值
+    recent_gains = gains[-periods:]
+    recent_losses = losses[-periods:]
+    
+    avg_gain = sum(recent_gains) / periods
+    avg_loss = sum(recent_losses) / periods
+    
+    if avg_loss == 0:
+        return 100
+        
+    rs = avg_gain / avg_loss
+    rsi = 100 - (100 / (1 + rs))
+    return rsi
+
+def calculate_macd(data, short=12, long=26, mid=9):
+    """计算MACD (DIF, DEA, MACD)"""
+    if not data or len(data) < long + mid: return None
+    
+    # 简单EMA计算
+    closes = [d['close'] for d in data]
+    
+    def get_ema(values, n):
+        ema = [values[0]]
+        alpha = 2 / (n + 1)
+        for i in range(1, len(values)):
+            ema.append(alpha * values[i] + (1 - alpha) * ema[-1])
+        return ema
+        
+    ema_short = get_ema(closes, short)
+    ema_long = get_ema(closes, long)
+    
+    dif = [s - l for s, l in zip(ema_short, ema_long)]
+    dea = get_ema(dif, mid)
+    
+    macd_bar = [(d - de) * 2 for d, de in zip(dif, dea)]
+    
+    return {
+        "dif": dif[-1],
+        "dea": dea[-1],
+        "macd": macd_bar[-1],
+        "prev_macd": macd_bar[-2]
+    }
+
+def calculate_kdj(data, n=9, m1=3, m2=3):
+    """计算KDJ"""
+    if not data or len(data) < n: return None
+    
+    k_val = 50
+    d_val = 50
+    
+    # 需要逐日计算以获得准确序列，这里简化计算最后几天
+    # 为了准确性，我们从足够早的地方开始算
+    start_idx = max(0, len(data) - 100) 
+    
+    for i in range(start_idx, len(data)):
+        # 获取过去N天(含今天)的最高最低
+        window = data[max(0, i-n+1):i+1]
+        if not window: continue
+        
+        low_n = min(d['low'] for d in window)
+        high_n = max(d['high'] for d in window)
+        close = data[i]['close']
+        
+        if high_n == low_n:
+            rsv = 50
+        else:
+            rsv = (close - low_n) / (high_n - low_n) * 100
+            
+        k_val = (m1-1)/m1 * k_val + 1/m1 * rsv
+        d_val = (m2-1)/m2 * d_val + 1/m2 * k_val
+        
+    j_val = 3 * k_val - 2 * d_val
+    
+    return {"k": k_val, "d": d_val, "j": j_val}
+
+def generate_analysis_data(code, name):
+    """生成分析数据字典 (分离数据与视图)"""
+    data = get_kline_data_analysis(code)
+    if not data: return None
+    
+    current_price = data[-1]['close']
+    yesterday_price = data[-2]['close']
+    
+    # 1. 趋势分析
+    ma5 = calculate_ma(data, 5)
+    ma20 = calculate_ma(data, 20)
+    ma60 = calculate_ma(data, 60)
+    macd = calculate_macd(data)
+    
+    # 2. 资金分析
+    vol_today = data[-1]['volume']
+    vol_ma5 = 0
+    if len(data) >= 6:
+        vol_ma5 = sum(d['volume'] for d in data[-6:-1]) / 5
+    
+    # 3. 情绪分析
+    rsi = calculate_rsi(data)
+    kdj = calculate_kdj(data)
+    
+    # 4. 综合研判打分
+    score = 0
+    
+    # 趋势分 (3分)
+    trend_desc = "震荡"
+    if ma20:
+        if current_price > ma20: 
+            score += 1
+            trend_desc = "多头"
+        else: 
+            score -= 1
+            trend_desc = "空头"
+            
+    # 均线排列
+    if ma5 and ma20:
+        if ma5 > ma20: score += 0.5
+        elif ma5 < ma20: score -= 0.5 # 空头排列扣分
+    
+    if macd:
+        # MACD 金叉/死叉
+        if macd['dif'] > macd['dea']: score += 0.5 # 金叉状态
+        elif macd['dif'] < macd['dea']: score -= 0.5 # 死叉状态
+        
+        if macd['macd'] > 0 and macd['macd'] > macd['prev_macd']: score += 0.5 # 红柱增长
+        if macd['dif'] > 0 and macd['dea'] > 0: score += 0.5 # 零轴上方
+    
+    # 资金分 (2分)
+    vol_desc = "平量"
+    vol_ratio = 0
+    if vol_ma5 > 0:
+        vol_ratio = vol_today / vol_ma5
+        if vol_ratio > 1.5: 
+            vol_desc = "放量"
+            if current_price > yesterday_price: score += 1 # 放量涨
+            else: score -= 1 # 放量跌
+        elif vol_ratio < 0.6: 
+            vol_desc = "缩量"
+            if current_price < yesterday_price: score += 0.5 # 缩量跌(惜售)
+            
+    # 情绪分 (2分)
+    sentiment_desc = "中性"
+    if rsi:
+        if rsi > 80: 
+            score -= 1
+            sentiment_desc = "超买"
+        elif rsi < 20: 
+            score += 1.5 # 超卖反弹权重高
+            sentiment_desc = "超卖"
+            
+    if kdj:
+        # KDJ 金叉/死叉
+        if kdj['k'] > kdj['d']: score += 0.5 # 金叉
+        elif kdj['k'] < kdj['d']: score -= 0.5 # 死叉
+        
+        if kdj['j'] < 0 or kdj['j'] > 100:
+             if kdj['j'] < 0: score += 0.5
+             if kdj['j'] > 100: score -= 0.5
+             
+    # 结论
+    conclusion = "观察"
+    action_color = "#888888" # Gray
+    if score >= 2.5:
+        conclusion = "积极买入"
+        action_color = "#FF4D4F" # Red
+    elif score >= 1:
+        conclusion = "持有/低吸"
+        action_color = "#FF7875" # Light Red
+    elif score <= -1.5:
+        conclusion = "减仓/卖出"
+        action_color = "#52C41A" # Green
+    elif score <= 0:
+        conclusion = "观望"
+        action_color = "#95DE64" # Light Green
+        
+    return {
+        "name": name,
+        "code": code,
+        "price": current_price,
+        "pct": (current_price - yesterday_price) / yesterday_price * 100,
+        "ma5": ma5,
+        "ma20": ma20,
+        "ma60": ma60,
+        "macd": macd,
+        "vol_ratio": vol_ratio,
+        "vol_desc": vol_desc,
+        "trend_desc": trend_desc,
+        "sentiment_desc": sentiment_desc,
+        "rsi": rsi,
+        "kdj": kdj,
+        "conclusion": conclusion,
+        "action_color": action_color,
+        "score": score
+    }
+
+def show_analysis_result(name, stock_info=None):
+    """显示分析结果窗口 (美化版)"""
+    # stock_info 是 generate_analysis_data 的返回值
+    # 如果没传，说明是旧调用，需要重新获取 (线程安全)
+    if not stock_info:
+         # 兼容旧代码，理论上 run_analysis_thread 应该改一下，这里先不处理，依赖线程传参
+         pass
+
+    # 创建Toplevel
+    top = tk.Toplevel(root)
+    top.title(f"技术面分析 - {stock_info['name']}")
+    top.overrideredirect(True) # 无边框模式，自己画标题栏
+    top.attributes("-topmost", True) # 确保置顶，防止被误认为关闭
+    
+    # === 窗口尺寸与定位 (侧边弹出) ===
+    width = 500
+    height = 700
+    
+    screen_w = root.winfo_screenwidth()
+    screen_h = root.winfo_screenheight()
+    root_x = root.winfo_x()
+    root_y = root.winfo_y()
+    root_w = root.winfo_width()
+    
+    # 默认放右边
+    pos_x = root_x + root_w + 10
+    # 如果右边放不下，放左边
+    if pos_x + width > screen_w:
+        pos_x = root_x - width - 10
+        
+    # 纵向位置对齐
+    pos_y = root_y
+    if pos_y + height > screen_h:
+        pos_y = screen_h - height - 10
+        
+    top.geometry(f"{width}x{height}+{int(pos_x)}+{int(pos_y)}")
+    top.configure(bg="#1E1E1E") # 深色背景
+    
+    # === 自定义标题栏 ===
+    title_frame = tk.Frame(top, bg="#2D2D2D", height=30)
+    title_frame.pack(fill="x")
+    
+    # 允许拖动
+    def start_move(event):
+        top.x = event.x
+        top.y = event.y
+    def do_move(event):
+        deltax = event.x - top.x
+        deltay = event.y - top.y
+        x = top.winfo_x() + deltax
+        y = top.winfo_y() + deltay
+        top.geometry(f"+{x}+{y}")
+    
+    title_frame.bind("<Button-1>", start_move)
+    title_frame.bind("<B1-Motion>", do_move)
+    
+    title_label = tk.Label(title_frame, text=f"📊 {stock_info['name']} ({stock_info['code']})", 
+             bg="#2D2D2D", fg="white", font=("Microsoft YaHei UI", 10, "bold"))
+    title_label.pack(side="left", padx=10)
+    # 绑定 Label 的拖动事件，解决点击文字无法拖动的问题
+    title_label.bind("<Button-1>", start_move)
+    title_label.bind("<B1-Motion>", do_move)
+             
+    # 关闭按钮
+    close_btn = tk.Label(title_frame, text="✕", bg="#2D2D2D", fg="#888888", font=("Arial", 12), cursor="hand2")
+    close_btn.pack(side="right", padx=10)
+    close_btn.bind("<Button-1>", lambda e: top.destroy())
+    close_btn.bind("<Enter>", lambda e: close_btn.config(fg="white"))
+    close_btn.bind("<Leave>", lambda e: close_btn.config(fg="#888888"))
+    content_frame = tk.Frame(top, bg="#1E1E1E", padx=15, pady=15)
+    content_frame.pack(fill="both", expand=True)
+    
+    # 1. 头部价格
+    price_color = "#FF4D4F" if stock_info['pct'] >= 0 else "#52C41A"
+    header_frame = tk.Frame(content_frame, bg="#1E1E1E")
+    header_frame.pack(fill="x", pady=(0, 15))
+    
+    tk.Label(header_frame, text=f"{stock_info['price']:.2f}", font=("Arial", 24, "bold"), 
+             bg="#1E1E1E", fg=price_color).pack(side="left")
+    tk.Label(header_frame, text=f"{stock_info['pct']:+.2f}%", font=("Arial", 14), 
+             bg="#1E1E1E", fg=price_color).pack(side="left", padx=10, pady=(8, 0))
+             
+    # 2. 结论卡片 (高亮)
+    con_frame = tk.Frame(content_frame, bg=stock_info['action_color'], padx=2, pady=2) # 边框色
+    con_frame.pack(fill="x", pady=(0, 15))
+    con_inner = tk.Frame(con_frame, bg="#252526", padx=10, pady=10)
+    con_inner.pack(fill="both", expand=True)
+    
+    tk.Label(con_inner, text="技术综合研判", font=("Microsoft YaHei UI", 9), bg="#252526", fg="#AAAAAA").pack(anchor="w")
+    
+    # 结论行容器，用于水平排列结论和分数
+    con_row = tk.Frame(con_inner, bg="#252526")
+    con_row.pack(fill="x", pady=5)
+    
+    tk.Label(con_row, text=stock_info['conclusion'], font=("Microsoft YaHei UI", 16, "bold"), 
+             bg="#252526", fg=stock_info['action_color']).pack(side="left", expand=True) # 居中
+             
+    # 右下角显示分数
+    tk.Label(con_inner, text=f"Score: {stock_info['score']:.1f}", font=("Arial", 8), bg="#252526", fg="#666666").pack(anchor="e")
+             
+    # 3. 指标网格
+    grid_frame = tk.Frame(content_frame, bg="#1E1E1E")
+    grid_frame.pack(fill="both", expand=True)
+    
+    def create_metric_row(parent, label, value, sub_value, status_color="#FFFFFF"):
+        row = tk.Frame(parent, bg="#1E1E1E", pady=3)
+        row.pack(fill="x")
+        tk.Label(row, text=label, font=("Microsoft YaHei UI", 10), bg="#1E1E1E", fg="#888888", width=8, anchor="w").pack(side="left")
+        tk.Label(row, text=value, font=("Arial", 10, "bold"), bg="#1E1E1E", fg="white").pack(side="left")
+        tk.Label(row, text=sub_value, font=("Microsoft YaHei UI", 9), bg="#1E1E1E", fg=status_color).pack(side="right")
+        return row
+
+    # 趋势
+    tk.Label(grid_frame, text="📈 趋势分析", font=("Microsoft YaHei UI", 10, "bold"), bg="#1E1E1E", fg="#CCCCCC").pack(anchor="w", pady=(5,5))
+    
+    trend_color = "#FF4D4F" if "多" in stock_info['trend_desc'] else "#52C41A"
+    create_metric_row(grid_frame, "均线状态", stock_info['trend_desc'], 
+                     f"MA5: {stock_info['ma5']:.2f}  MA20: {stock_info['ma20']:.2f}" if stock_info['ma20'] else "--", trend_color)
+                     
+    macd_val = stock_info['macd']['macd'] if stock_info['macd'] else 0
+    # MACD 描述优化
+    if stock_info['macd']:
+        dif = stock_info['macd']['dif']
+        dea = stock_info['macd']['dea']
+        macd_state = "金叉" if dif > dea else "死叉"
+        macd_color = "#FF4D4F" if dif > dea else "#52C41A"
+    else:
+        macd_state = "--"
+        macd_color = "#888888"
+        
+    create_metric_row(grid_frame, "MACD信号", macd_state, f"DIF: {stock_info['macd']['dif']:.3f}" if stock_info['macd'] else "--", macd_color)
+
+    tk.Frame(grid_frame, height=1, bg="#333333").pack(fill="x", pady=8) # 分割线
+
+    # 资金
+    tk.Label(grid_frame, text="💰 资金分析", font=("Microsoft YaHei UI", 10, "bold"), bg="#1E1E1E", fg="#CCCCCC").pack(anchor="w", pady=(5,5))
+    
+    vol_color = "#FF4D4F" if stock_info['vol_ratio'] > 1.5 else ("#52C41A" if stock_info['vol_ratio'] < 0.6 else "white")
+    create_metric_row(grid_frame, "量比", f"{stock_info['vol_ratio']:.2f}", stock_info['vol_desc'], vol_color)
+
+    tk.Frame(grid_frame, height=1, bg="#333333").pack(fill="x", pady=8) # 分割线
+    
+    # 情绪
+    tk.Label(grid_frame, text="🌡️ 情绪分析", font=("Microsoft YaHei UI", 10, "bold"), bg="#1E1E1E", fg="#CCCCCC").pack(anchor="w", pady=(5,5))
+    
+    rsi_val = stock_info['rsi'] if stock_info['rsi'] else 0
+    rsi_color = "#FF4D4F" if rsi_val > 80 else ("#52C41A" if rsi_val < 20 else "white")
+    create_metric_row(grid_frame, "RSI(14)", f"{rsi_val:.1f}", stock_info['sentiment_desc'], rsi_color)
+    
+    kdj_j = stock_info['kdj']['j'] if stock_info['kdj'] else 0
+    
+    # KDJ 信号展示
+    if stock_info['kdj']:
+        k = stock_info['kdj']['k']
+        d = stock_info['kdj']['d']
+        kdj_signal = "金叉" if k > d else "死叉"
+        kdj_color = "#FF4D4F" if k > d else "#52C41A"
+    else:
+        kdj_signal = "--"
+        kdj_color = "#888888"
+        
+    create_metric_row(grid_frame, "KDJ信号", kdj_signal, f"J: {kdj_j:.1f}", kdj_color)
+    
+    # 免责声明
+    tk.Label(content_frame, text="⚠️ 本工具分析结果仅供个人娱乐，不构成任何投资建议", 
+             font=("Microsoft YaHei UI", 8), bg="#1E1E1E", fg="#555555").pack(side="bottom", pady=10)
+
+
+def run_analysis_thread(stock):
+    """在线程中运行分析"""
+    def task():
+        # 获取结构化数据
+        data = generate_analysis_data(stock['code'], stock['name'])
+        if data:
+            root.after(0, lambda: show_analysis_result(stock['name'], data))
+        else:
+            # 错误处理
+            pass
+        
+    threading.Thread(target=task, daemon=True).start()
+
 def show_context_menu(event):
     """显示右键菜单"""
     menu = tk.Menu(root, tearoff=0)
+    
+    # 查找点击的是哪个股票
+    clicked_stock = None
+    if stock_row_widgets:
+        for i, row in enumerate(stock_row_widgets):
+            # 检查点击的组件是否在当前行的组件列表中
+            if event.widget in row.values():
+                clicked_stock = STOCKS[i]
+                break
+                
+    if clicked_stock:
+        # 添加分析选项 (仅对股票/指数有效)
+        code = clicked_stock['code']
+        # 简单过滤掉明显不支持的品种 (如黄金、外汇的前缀)
+        if not code.startswith(("hf_", "gds_", "nf_")):
+            menu.add_command(label=f"📈 技术面分析: {clicked_stock['name']}", 
+                            command=lambda s=clicked_stock: run_analysis_thread(s))
+            menu.add_separator()
     
     # 显示模式子菜单
     mode_menu = tk.Menu(menu, tearoff=0)
