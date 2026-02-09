@@ -12,6 +12,8 @@ from datetime import datetime
 import math
 import random
 
+VERSION = "0.4.0"
+
 # ================= 配置区域 =================
 CONFIG_FILE = "stock_config.json"
 DEFAULT_STOCKS = [
@@ -28,8 +30,10 @@ root = None
 last_percentages = {} # 记录上次的涨跌幅: {code: percent}
 display_mode = "bar" # 显示模式: "percent" (百分比) 或 "bar" (柱状图)
 show_price = True # 是否显示价格
+show_volume = True # 是否显示成交量
 session_max_map = {} # 本次运行期间每只股票出现过的最大涨跌幅绝对值 {code: max_percent}
 current_date_str = datetime.now().strftime("%Y-%m-%d") # 当前运行日期
+MA5_VOLUMES = {} # 5日均量 {code: avg_volume}
 
 # 刷新频率（秒）
 REFRESH_RATE = 1
@@ -42,7 +46,7 @@ FONT_CONFIG = ("Microsoft YaHei UI", 10, "bold")
 
 def load_config():
     """加载配置文件"""
-    global STOCKS, display_mode, session_max_map, show_price
+    global STOCKS, display_mode, session_max_map, show_price, show_volume
     if os.path.exists(CONFIG_FILE):
         try:
             with open(CONFIG_FILE, 'r', encoding='utf-8') as f:
@@ -54,6 +58,7 @@ def load_config():
                     STOCKS = data.get("stocks", DEFAULT_STOCKS)
                     display_mode = data.get("display_mode", "bar")
                     show_price = data.get("show_price", True)
+                    show_volume = data.get("show_volume", True)
                     
                     # 检查日期，如果是今天则恢复 session_max_map，否则重置
                     saved_date = data.get("date", "")
@@ -66,10 +71,12 @@ def load_config():
             STOCKS = DEFAULT_STOCKS
             session_max_map = {}
             show_price = True
+            show_volume = True
     else:
         STOCKS = DEFAULT_STOCKS
         session_max_map = {}
         show_price = True
+        show_volume = True
 
 def save_config():
     """保存配置文件"""
@@ -78,6 +85,7 @@ def save_config():
             "stocks": STOCKS,
             "display_mode": display_mode,
             "show_price": show_price,
+            "show_volume": show_volume,
             "session_max_map": session_max_map,
             "date": datetime.now().strftime("%Y-%m-%d")
         }
@@ -85,6 +93,68 @@ def save_config():
             json.dump(data, f, ensure_ascii=False, indent=4)
     except Exception as e:
         print(f"Error saving config: {e}")
+
+def get_ma5_volumes_thread():
+    """后台线程获取5日均量"""
+    global MA5_VOLUMES
+    print("Fetching MA5 volumes...")
+    
+    # 构建代码映射 (复用 get_stock_data_tencent 的逻辑)
+    # 这一步是为了确保 K线接口用的是正确的 sh/sz 代码
+    mapped_codes = {}
+    for item in STOCKS:
+        original = item["code"]
+        api_code = original
+        if original.startswith("csi"):
+            api_code = "sh" + original[3:]
+        elif original.startswith("sh1b"):
+            api_code = "sh00" + original[4:]
+        elif original.startswith("cns"):
+            api_code = "sh" + original[3:]
+        mapped_codes[original] = api_code
+
+    for original_code, api_code in mapped_codes.items():
+        # 过滤不支持K线均量查询的特殊代码 (期货/现货/外汇等)
+        if original_code.startswith(("hf_", "gds_", "nf_", "Au", "Ag", "Pt")):
+            continue
+
+        try:
+            # 获取6天数据，为了排除今天（如果今天已经有数据）
+            url = f"http://web.ifzq.gtimg.cn/appstock/app/fqkline/get?param={api_code},day,,,6,qfq"
+            resp = requests.get(url, timeout=2)
+            if resp.status_code != 200:
+                continue
+                
+            data = resp.json()
+            # 腾讯接口结构: data['data'][code]['day'] 或 'qfqday'
+            # 注意: 如果 api_code 不存在或返回格式异常 (如 'list' object), 这里会抛出 AttributeError
+            if not isinstance(data.get('data'), dict):
+                continue
+
+            stock_data = data['data'].get(api_code, {})
+            days = []
+            if 'day' in stock_data:
+                days = stock_data['day']
+            elif 'qfqday' in stock_data:
+                days = stock_data['qfqday']
+            
+            if not days:
+                continue
+                
+            # 排除今天的数据，只取过去的
+            today = datetime.now().strftime("%Y-%m-%d")
+            history_days = [d for d in days if d[0] != today]
+            
+            # 取最后5天
+            last_5 = history_days[-5:]
+            if len(last_5) > 0:
+                # index 5 是成交量
+                avg_vol = sum(float(d[5]) for d in last_5) / len(last_5)
+                MA5_VOLUMES[original_code] = avg_vol
+                print(f"MA5 for {original_code}: {avg_vol}")
+                
+        except Exception as e:
+            print(f"Error fetching MA5 for {original_code}: {e}")
 
 def get_stock_data_tencent(codes):
     """
@@ -187,8 +257,25 @@ def get_stock_data_tencent(codes):
 
     # 2. 获取腾讯数据 (股票/ETF/外汇/美股)
     if tencent_codes:
+        # 构建 code_map 以便在解析时还原原始代码
+        code_map = {}
+        for code in tencent_codes:
+            api_code = code
+            if code.startswith("csi"):
+                api_code = "sh" + code[3:]
+            elif code.startswith("sh1b"):
+                api_code = "sh00" + code[4:]
+            elif code.startswith("cns"):
+                api_code = "sh" + code[3:]
+            code_map[api_code] = code
+
+        # 使用 api_code 进行查询
+        api_query_codes = list(code_map.keys())
+        # 对于不需要转换的普通代码，也要确保在 code_map 里
+        # (上面的循环其实已经覆盖了，因为 default api_code = code)
+        
         try:
-            url = f"http://qt.gtimg.cn/q={','.join(tencent_codes)}"
+            url = f"http://qt.gtimg.cn/q={','.join(api_query_codes)}"
             resp = requests.get(url, timeout=2)
             
             # 腾讯接口返回GBK编码，需要正确解码
@@ -211,6 +298,9 @@ def get_stock_data_tencent(codes):
                     # 或者直接取 v_ 之后的部分
                     key = temp[2:] # 去掉 "v_"
                     
+                    # 还原回用户输入的 code
+                    original_code = code_map.get(key, key)
+                    
                     data_str = line.split('="')[1].strip('"')
                     
                     # 1. 尝试普通股票格式 (~)
@@ -218,7 +308,8 @@ def get_stock_data_tencent(codes):
                     if len(data) > 30:
                         current_price = float(data[3])
                         percent = float(data[32])
-                        results[key] = (current_price, percent)
+                        volume = float(data[6]) # 成交量(手)
+                        results[original_code] = (current_price, percent, volume)
                         continue
                         
                     # 2. 尝试期货/外汇格式 (,)
@@ -240,8 +331,8 @@ def get_stock_data_tencent(codes):
                                     percent = 0.0
                             else:
                                 percent = 0.0
-                                
-                        results[key] = (current_price, percent)
+                        
+                        results[original_code] = (current_price, percent, 0) # 暂不支持量
                 except Exception:
                     continue
         except Exception as e:
@@ -335,6 +426,7 @@ stock_row_widgets = []
 last_display_mode = None
 last_stock_count = 0
 last_show_price = None
+last_show_volume = None
 
 def bind_events(widget):
     """绑定通用事件到组件"""
@@ -343,10 +435,33 @@ def bind_events(widget):
     widget.bind("<Button-3>", show_context_menu)
     widget.bind("<Double-Button-1>", minimize_window)
 
+def get_trading_minutes():
+    """计算当前已交易分钟数 (0-240)"""
+    now = datetime.now()
+    start_am = now.replace(hour=9, minute=30, second=0, microsecond=0)
+    end_am = now.replace(hour=11, minute=30, second=0, microsecond=0)
+    start_pm = now.replace(hour=13, minute=0, second=0, microsecond=0)
+    end_pm = now.replace(hour=15, minute=0, second=0, microsecond=0)
+
+    if now < start_am: return 0
+    if now >= end_pm: return 240
+
+    minutes = 0
+    if now >= start_am:
+        if now <= end_am:
+            minutes = (now - start_am).total_seconds() / 60
+        else:
+            minutes = 120 # Full morning
+
+    if now >= start_pm:
+        minutes += (now - start_pm).total_seconds() / 60
+    
+    return min(minutes, 240)
+
 def refresh_labels(data_map):
     """在主线程刷新Labels (重构版：支持Grid布局)"""
     global main_frame, stock_row_widgets, last_display_mode, last_stock_count, root, last_percentages
-    global session_max_map, current_date_str, show_price, last_show_price
+    global session_max_map, current_date_str, show_price, last_show_price, show_volume, last_show_volume
     
     if not root: return
     
@@ -364,10 +479,11 @@ def refresh_labels(data_map):
         bind_events(main_frame) # 允许拖动背景
         
     # 检查是否需要重建布局
-    # 条件：模式改变 或 股票数量改变 或 价格显示设置改变
+    # 条件：模式改变 或 股票数量改变 或 价格显示设置改变 或 成交量显示改变
     need_rebuild = (display_mode != last_display_mode) or \
                    (len(STOCKS) != last_stock_count) or \
-                   (show_price != last_show_price)
+                   (show_price != last_show_price) or \
+                   (show_volume != last_show_volume)
     
     if need_rebuild:
         # 清除旧组件
@@ -422,12 +538,22 @@ def refresh_labels(data_map):
                 bind_events(pct_label)
                 row_widgets['pct'] = pct_label
                 col_idx += 1
+            
+            # 5. 成交量 (可选，放在最后)
+            if show_volume:
+                vol_label = tk.Label(main_frame, text="", bg="black", fg="white",
+                                   font=FONT_CONFIG, anchor="w") # 左对齐
+                vol_label.grid(row=i, column=col_idx, sticky="nswe", padx=(5, 10), pady=2)
+                bind_events(vol_label)
+                row_widgets['vol'] = vol_label
+                col_idx += 1
                 
             stock_row_widgets.append(row_widgets)
             
         last_display_mode = display_mode
         last_stock_count = len(STOCKS)
         last_show_price = show_price
+        last_show_volume = show_volume
         
         # 配置列权重
         # 无论多少列，最后一列（百分比）通常需要一点权重，或者名称列自适应
@@ -445,7 +571,10 @@ def refresh_labels(data_map):
     
     # 1. 更新每只股票的历史最大值 (Session Max)
     for code in data_map:
-        _, percent = data_map[code]
+        # 兼容 (price, percent) 和 (price, percent, volume)
+        val = data_map[code]
+        percent = val[1]
+        
         cur_abs = abs(percent)
         if cur_abs > session_max_map.get(code, 0.0):
             session_max_map[code] = cur_abs
@@ -480,11 +609,39 @@ def refresh_labels(data_map):
         color = "#cccccc"
         percent = 0.0
         current_price = 0.0
+        vol_text = ""
         
         if code in data_map:
-            current_price, percent = data_map[code]
+            val = data_map[code]
+            volume = 0
+            if len(val) == 3:
+                current_price, percent, volume = val
+            else:
+                current_price, percent = val
+            
             color = "#ff3333" if percent > 0 else "#00cc00"
             if percent == 0: color = "#cccccc"
+            
+            # 成交量分析 (放量/缩量)
+            # 只有在开盘期间或收盘后才计算
+            mins = get_trading_minutes()
+            if show_volume and mins > 5 and code in MA5_VOLUMES: # 开盘5分钟后再看，避免初始波动
+                ma5_vol = MA5_VOLUMES[code]
+                if ma5_vol > 0:
+                    # 预测今日全天成交量
+                    proj_vol = (volume / mins) * 240
+                    ratio = proj_vol / ma5_vol
+                    
+                    # 显示量比数值
+                    vol_text = f"{ratio:.1f}x"
+                    
+                    # 调整阈值 (基于网络调研：1.5倍以上即为明显放量，0.6以下为明显缩量)
+                    if ratio > 1.5: # 放量 (原2.0太难触发)
+                        vol_text += "🔥"
+                    elif ratio < 0.6: # 缩量 (原0.5太难触发)
+                        vol_text += "❄️"
+                    else:
+                        vol_text += "📊"
             
             # 抖动检测
             if code in last_percentages:
@@ -506,6 +663,10 @@ def refresh_labels(data_map):
         # 更新百分比
         pct_text = f"{percent:+.2f}%" if code in data_map else "--"
         widgets['pct'].config(text=pct_text, fg=color)
+        
+        # 更新成交量
+        if 'vol' in widgets:
+            widgets['vol'].config(text=vol_text, fg=color)
         
         # 更新柱状图 (如果存在)
         if 'bar' in widgets:
@@ -639,6 +800,14 @@ def toggle_show_price():
     # 立即触发刷新
     if root: root.after(0, lambda: refresh_labels({}))
 
+def toggle_show_volume():
+    """切换是否显示成交量"""
+    global show_volume
+    show_volume = not show_volume
+    save_config()
+    # 立即触发刷新
+    if root: root.after(0, lambda: refresh_labels({}))
+
 def quit_app():
     """退出程序，解决残留白框问题"""
     global root
@@ -665,6 +834,10 @@ def show_context_menu(event):
     # 显示价格开关
     price_label = "隐藏价格 (Hide Price)" if show_price else "显示价格 (Show Price)"
     menu.add_command(label=price_label, command=toggle_show_price)
+    
+    # 显示成交量开关
+    vol_label = "隐藏成交量 (Hide Volume)" if show_volume else "显示成交量 (Show Volume)"
+    menu.add_command(label=vol_label, command=toggle_show_volume)
     
     menu.add_separator()
     menu.add_command(label="配置股票", command=open_settings)
@@ -1062,6 +1235,10 @@ def main():
     # 启动数据更新线程
     t = threading.Thread(target=update_ui_loop, daemon=True)
     t.start()
+    
+    # 启动 MA5 获取线程
+    ma5_thread = threading.Thread(target=get_ma5_volumes_thread, daemon=True)
+    ma5_thread.start()
     
     root.mainloop()
 
